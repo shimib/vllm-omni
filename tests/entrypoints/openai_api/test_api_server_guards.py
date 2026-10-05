@@ -186,6 +186,11 @@ _DIFFUSION_APP_STATE_KEYS = {
     "diffusion_engine",
     "openai_serving_models",
     "serving_tokenization",
+    "serving_tokens",
+    "serving_render",
+    "serving_derender",
+    "online_derenderer",
+    "tool_server",
     "openai_serving_chat",
     "openai_serving_chat_batch",
     "openai_serving_speech",
@@ -203,6 +208,11 @@ _DIFFUSION_APP_STATE_KEYS = {
 _DIFFUSION_MUST_BE_NONE = {
     "vllm_config",
     "serving_tokenization",
+    "serving_tokens",
+    "serving_render",
+    "serving_derender",
+    "online_derenderer",
+    "tool_server",
     "openai_serving_duplex",
     "openai_streaming_speech",
     "openai_streaming_video",
@@ -217,7 +227,12 @@ _MULTISTAGE_APP_STATE_KEYS = {
     "vllm_config",
     "openai_serving_models",
     "serving_tokenization",
+    "serving_tokens",
+    "serving_render",
+    "serving_derender",
     "online_renderer",
+    "online_derenderer",
+    "tool_server",
     "openai_serving_chat",
     "openai_serving_chat_batch",
     "openai_serving_speech",
@@ -235,6 +250,9 @@ _MULTISTAGE_MUST_BE_NONE = {
     "openai_serving_duplex",
     "openai_serving_realtime_robot",
     "rl_rollout_serving",
+    # No ``--tool-server`` in ``_minimal_args``; the key must still exist because
+    # upstream ``ServingRender`` reads it from ``app.state``.
+    "tool_server",
 }
 _MULTISTAGE_MUST_BE_WIRED = _MULTISTAGE_APP_STATE_KEYS - _MULTISTAGE_MUST_BE_NONE
 
@@ -1052,22 +1070,51 @@ async def test_pure_diffusion_speech_forwards_media_access_args(monkeypatch, tmp
     assert config.speaker_max_bytes == 0
 
 
-@pytest.mark.asyncio
-async def test_multistage_app_state_key_snapshot(monkeypatch, tmp_path) -> None:
-    """Lock multi-stage ``app.state`` keys after init, including live vs None.
+# Serving constructors swapped for recording fakes when exercising the
+# multi-stage branch of ``omni_init_app_state`` without an engine.
+_MULTISTAGE_SERVING_CTORS = (
+    "OnlineRenderer",
+    "OnlineDerenderer",
+    "OpenAIServingResponses",
+    "OmniOpenAIServingChat",
+    "OmniOpenAIServingChatBatch",
+    "OpenAIServingCompletion",
+    "ServingPooling",
+    "OpenAIServingEmbedding",
+    "ServingClassification",
+    "ServingScores",
+    "ServingTokenization",
+    "OpenAIServingTranscription",
+    "OpenAIServingTranslation",
+    "AnthropicServingMessages",
+    "ServingRender",
+    "ServingDerender",
+    "ServingTokens",
+    "OmniOpenAIServingAudioGenerate",
+    "OmniStreamingSpeechHandler",
+    "OmniOpenAIServingVideo",
+)
 
-    Fails if chat/speech/video/realtime/tokenization keys disappear or are
-    left as None after init refactors — classic “route still registered,
-    handler never wired” failure mode.
-    """
-    engine = _FakeEngineClient(
-        stage_configs=[object(), object()],
-        vllm_config=SimpleNamespace(
-            lora_config=None,
-            model_config=SimpleNamespace(),
-            parallel_config=SimpleNamespace(_api_process_rank=0),
-        ),
+
+def _multistage_engine(**vllm_config_overrides) -> _FakeEngineClient:
+    vllm_config = SimpleNamespace(
+        lora_config=None,
+        model_config=SimpleNamespace(),
+        parallel_config=SimpleNamespace(_api_process_rank=0),
     )
+    for key, value in vllm_config_overrides.items():
+        setattr(vllm_config, key, value)
+    return _FakeEngineClient(stage_configs=[object(), object()], vllm_config=vllm_config)
+
+
+def _patch_multistage_serving(monkeypatch) -> dict[str, list[dict[str, Any]]]:
+    """Replace every serving constructor with a fake that records its kwargs.
+
+    Returns ``{ctor_name: [kwargs, ...]}`` so tests can assert on what the
+    init passed to each service without constructing real upstream objects.
+    """
+    captured: dict[str, list[dict[str, Any]]] = {name: [] for name in _MULTISTAGE_SERVING_CTORS}
+    captured["OmniOpenAIServingSpeech"] = []
 
     class _FakeModels:
         def __init__(self, *args, **kwargs):
@@ -1076,21 +1123,20 @@ async def test_multistage_app_state_key_snapshot(monkeypatch, tmp_path) -> None:
         async def init_static_loras(self):
             return None
 
-    class _FakeCtor:
+    def _recording_ctor(name: str):
+        class _FakeCtor:
+            def __init__(self, *args, **kwargs):
+                captured[name].append(kwargs)
+
+            def warmup(self):
+                return None
+
+        _FakeCtor.__name__ = f"Fake{name}"
+        return _FakeCtor
+
+    class _FakeSpeech:
         def __init__(self, *args, **kwargs):
-            pass
-
-        def warmup(self):
-            return None
-
-    deploy = tmp_path / "deploy.yaml"
-    deploy.write_text("speech_cache:\n  resolve_max_bytes: 1024\n  speaker_max_bytes: 8\n")
-    engine.config_path = str(deploy)
-    speech_kwargs = {}
-
-    class _FakeSpeech(_FakeCtor):
-        def __init__(self, *args, **kwargs):
-            speech_kwargs.update(kwargs)
+            captured["OmniOpenAIServingSpeech"].append(kwargs)
 
         async def warmup(self):
             return None
@@ -1098,28 +1144,30 @@ async def test_multistage_app_state_key_snapshot(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(api_server, "load_chat_template", lambda *_a, **_k: None)
     monkeypatch.setattr(api_server, "process_lora_modules", lambda modules, _defaults: modules or [])
     monkeypatch.setattr(api_server, "OpenAIServingModels", _FakeModels)
-    monkeypatch.setattr(api_server, "OnlineRenderer", _FakeCtor)
-    monkeypatch.setattr(api_server, "OpenAIServingResponses", _FakeCtor)
-    monkeypatch.setattr(api_server, "OmniOpenAIServingChat", _FakeCtor)
-    monkeypatch.setattr(api_server, "OmniOpenAIServingChatBatch", _FakeCtor)
-    monkeypatch.setattr(api_server, "OpenAIServingCompletion", _FakeCtor)
-    monkeypatch.setattr(api_server, "ServingPooling", _FakeCtor)
-    monkeypatch.setattr(api_server, "OpenAIServingEmbedding", _FakeCtor)
-    monkeypatch.setattr(api_server, "ServingClassification", _FakeCtor)
-    monkeypatch.setattr(api_server, "ServingScores", _FakeCtor)
-    monkeypatch.setattr(api_server, "ServingTokenization", _FakeCtor)
-    monkeypatch.setattr(api_server, "OpenAIServingTranscription", _FakeCtor)
-    monkeypatch.setattr(api_server, "OpenAIServingTranslation", _FakeCtor)
-    monkeypatch.setattr(api_server, "AnthropicServingMessages", _FakeCtor)
-    monkeypatch.setattr(api_server, "ServingTokens", _FakeCtor)
+    for name in _MULTISTAGE_SERVING_CTORS:
+        monkeypatch.setattr(api_server, name, _recording_ctor(name))
     monkeypatch.setattr(api_server, "OmniOpenAIServingSpeech", _FakeSpeech)
-    monkeypatch.setattr(api_server, "OmniOpenAIServingAudioGenerate", _FakeCtor)
-    monkeypatch.setattr(api_server, "OmniStreamingSpeechHandler", _FakeCtor)
     monkeypatch.setattr(api_server, "create_streaming_video_handler", lambda **_k: _marker("streaming_video"))
-    monkeypatch.setattr(api_server, "OmniOpenAIServingVideo", _FakeCtor)
+    return captured
+
+
+@pytest.mark.asyncio
+async def test_multistage_app_state_key_snapshot(monkeypatch, tmp_path) -> None:
+    """Lock multi-stage ``app.state`` keys after init, including live vs None.
+
+    Fails if chat/speech/video/realtime/tokenization keys disappear or are
+    left as None after init refactors — classic “route still registered,
+    handler never wired” failure mode.
+    """
+    engine = _multistage_engine()
+    deploy = tmp_path / "deploy.yaml"
+    deploy.write_text("speech_cache:\n  resolve_max_bytes: 1024\n  speaker_max_bytes: 8\n")
+    engine.config_path = str(deploy)
+    captured = _patch_multistage_serving(monkeypatch)
 
     state = State()
     await api_server.omni_init_app_state(engine, state, _minimal_args())
+    (speech_kwargs,) = captured["OmniOpenAIServingSpeech"]
     assert speech_kwargs["speech_cache_config"].resolve_max_bytes == 1024
     assert speech_kwargs["speech_cache_config"].resolve_max_entries == 2048
     assert speech_kwargs["speech_cache_config"].speaker_max_bytes == 8
@@ -1130,6 +1178,88 @@ async def test_multistage_app_state_key_snapshot(monkeypatch, tmp_path) -> None:
         must_be_wired=_MULTISTAGE_MUST_BE_WIRED,
         must_be_none=_MULTISTAGE_MUST_BE_NONE,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tokens_only", [False, True])
+async def test_multistage_scale_out_state_is_wired_for_upstream_routes(monkeypatch, tokens_only: bool) -> None:
+    """Lock the scale-out (Disaggregated Everything) state behind upstream routes.
+
+    Upstream ``build_app`` registers ``/v1/chat/completions/render``,
+    ``/v1/chat/completions/derender`` and ``/inference/v1/generate`` whenever
+    ``--enable-scale-out`` or ``--tokens-only`` is set, and their handlers
+    read ``serving_render`` / ``serving_derender`` / ``serving_tokens`` from
+    ``app.state``. Fails if init stops wiring one of them (the route then
+    answers "The model does not support ... API") or stops forwarding
+    ``--tokens-only`` as ``force_no_detokenize``.
+    """
+    engine = _multistage_engine()
+    captured = _patch_multistage_serving(monkeypatch)
+
+    state = State()
+    await api_server.omni_init_app_state(engine, state, _minimal_args(tokens_only=tokens_only))
+
+    assert state.serving_render is not None
+    assert state.serving_derender is not None
+    assert state.serving_tokens is not None
+    assert state.online_derenderer is not None
+
+    (render_kwargs,) = captured["ServingRender"]
+    assert render_kwargs["tool_server"] is state.tool_server
+    (tokens_kwargs,) = captured["ServingTokens"]
+    assert tokens_kwargs["force_no_detokenize"] is tokens_only
+    (derenderer_kwargs,) = captured["OnlineDerenderer"]
+    (renderer_kwargs,) = captured["OnlineRenderer"]
+    # Render and derender must agree on template / parser configuration or the
+    # derendered text diverges from what the coordinator rendered.
+    assert derenderer_kwargs == renderer_kwargs
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("cli_reasoning_parser", "config_reasoning_parser", "expected"),
+    [
+        (None, None, None),
+        (None, "openai_gptoss", "openai_gptoss"),
+        ("qwen3", "openai_gptoss", "qwen3"),
+    ],
+    ids=["unset", "model_default", "cli_wins"],
+)
+async def test_multistage_reasoning_parser_falls_back_to_engine_resolved_config(
+    monkeypatch, cli_reasoning_parser, config_reasoning_parser, expected
+) -> None:
+    """Lock where the frontend parsers get their reasoning parser from.
+
+    ``create_engine_config`` runs in the stage subprocess, so the API process
+    never sees model-specific defaults applied by ``verify_and_update_config``
+    on ``args.structured_outputs_config``. Init must fall back to the
+    engine-resolved ``vllm_config`` while an explicit CLI flag still wins.
+    """
+    engine = _multistage_engine(
+        structured_outputs_config=SimpleNamespace(reasoning_parser=config_reasoning_parser),
+    )
+    captured = _patch_multistage_serving(monkeypatch)
+
+    state = State()
+    await api_server.omni_init_app_state(
+        engine,
+        state,
+        _minimal_args(
+            reasoning_parser=cli_reasoning_parser,
+            structured_outputs_config=SimpleNamespace(reasoning_parser=cli_reasoning_parser),
+        ),
+    )
+
+    for name in (
+        "OnlineRenderer",
+        "OnlineDerenderer",
+        "OpenAIServingResponses",
+        "OmniOpenAIServingChat",
+        "OmniOpenAIServingChatBatch",
+        "AnthropicServingMessages",
+    ):
+        (kwargs,) = captured[name]
+        assert kwargs["reasoning_parser"] == expected, name
 
 
 @pytest.mark.parametrize("count", [None, 0, -1, "2", True])

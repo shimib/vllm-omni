@@ -59,6 +59,8 @@ from vllm.entrypoints.pooling.classify.serving import ServingClassification
 from vllm.entrypoints.pooling.embed.serving import ServingEmbedding as OpenAIServingEmbedding
 from vllm.entrypoints.pooling.pooling.serving import ServingPooling
 from vllm.entrypoints.pooling.scoring.serving import ServingScores
+from vllm.entrypoints.scale_out.derender.serving import ServingDerender
+from vllm.entrypoints.scale_out.render.serving import ServingRender
 from vllm.entrypoints.scale_out.token_in_token_out.serving import ServingTokens
 from vllm.entrypoints.serve.engine.protocol import ErrorResponse
 
@@ -80,6 +82,7 @@ from vllm.entrypoints.speech_to_text.translation.serving import (
     OpenAIServingTranslation,
 )
 from vllm.logger import configure_logging_from_args, init_logger
+from vllm.renderers.online_derenderer import OnlineDerenderer
 from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.tasks import POOLING_TASKS
 from vllm.tool_parsers import ToolParserManager
@@ -655,6 +658,24 @@ async def build_async_omni_from_stage_config(
             async_omni.shutdown()
 
 
+def _resolve_reasoning_parser(args: Namespace, vllm_config: Any) -> str | None:
+    """Pick the reasoning parser the frontend parsers should use.
+
+    Upstream resolves this inside ``create_engine_config``, which also lets
+    ``verify_and_update_config`` apply model-specific defaults (for example
+    ``openai_gptoss`` for gpt-oss). vLLM-Omni runs that in the stage
+    subprocess, so the API process only sees the CLI value on ``args``. Prefer
+    the explicit flag, then fall back to the engine-resolved config so model
+    defaults are honored here too.
+    """
+    cli_parser = getattr(args, "reasoning_parser", None) or args.structured_outputs_config.reasoning_parser
+    if cli_parser:
+        return cli_parser
+    # ``vllm_config`` is None for engines that expose no comprehension stage.
+    structured_outputs_config = getattr(vllm_config, "structured_outputs_config", None)
+    return getattr(structured_outputs_config, "reasoning_parser", None) or None
+
+
 async def _init_duplex_app_state(
     engine_client: DuplexOmni,
     state: State,
@@ -673,6 +694,10 @@ async def _init_duplex_app_state(
     )
     state.serving_tokenization = None
     state.serving_tokens = None
+    state.serving_render = None
+    state.serving_derender = None
+    state.online_derenderer = None
+    state.tool_server = None
     # Replaced by the chat init below when the model serves chat.
     state.online_renderer = None
     for attribute in (
@@ -747,6 +772,7 @@ async def _init_duplex_chat(
         if tokenizer is None or getattr(tokenizer, "chat_template", None) is None:
             resolved_chat_template = _load_model_chat_template_json(args.model)
 
+    reasoning_parser = _resolve_reasoning_parser(args, state.vllm_config)
     state.online_renderer = OnlineRenderer(
         model_config=engine_client.model_config,
         renderer=engine_client.renderer,
@@ -757,7 +783,7 @@ async def _init_duplex_chat(
         enable_auto_tools=args.enable_auto_tool_choice,
         exclude_tools_when_tool_choice_none=args.exclude_tools_when_tool_choice_none,
         tool_parser=args.tool_call_parser,
-        reasoning_parser=args.structured_outputs_config.reasoning_parser,
+        reasoning_parser=reasoning_parser,
         default_chat_template_kwargs=args.default_chat_template_kwargs,
     )
     return OmniOpenAIServingChat(
@@ -774,7 +800,7 @@ async def _init_duplex_chat(
         enable_auto_tools=args.enable_auto_tool_choice,
         exclude_tools_when_tool_choice_none=args.exclude_tools_when_tool_choice_none,
         tool_parser=args.tool_call_parser,
-        reasoning_parser=args.structured_outputs_config.reasoning_parser,
+        reasoning_parser=reasoning_parser,
         enable_prompt_tokens_details=args.enable_prompt_tokens_details,
         enable_force_include_usage=args.enable_force_include_usage,
         enable_log_outputs=args.enable_log_outputs,
@@ -848,8 +874,14 @@ async def omni_init_app_state(
         state.vllm_config = None
         state.diffusion_engine = engine_client
         state.openai_serving_models = openai_models_serving._DiffusionServingModels(base_model_paths)
-        # OMNI: tokenization endpoints are not supported in pure diffusion mode.
+        # OMNI: tokenization and scale-out (render / derender / token-in
+        # token-out) endpoints are not supported in pure diffusion mode.
         state.serving_tokenization = None
+        state.serving_tokens = None
+        state.serving_render = None
+        state.serving_derender = None
+        state.online_derenderer = None
+        state.tool_server = None
 
         # Use for_diffusion method to create chat handler
         state.openai_serving_chat = OmniOpenAIServingChat.for_diffusion(
@@ -948,6 +980,8 @@ async def omni_init_app_state(
         await tool_server.add_tool_server(args.tool_server)
     else:
         tool_server = None
+    # Upstream ``ServingRender`` reads the tool server from ``app.state``.
+    state.tool_server = tool_server
 
     # Merge default_mm_loras into the static lora_modules
     default_mm_loras = (
@@ -1003,6 +1037,8 @@ async def omni_init_app_state(
     )
     await state.openai_serving_models.init_static_loras()
 
+    reasoning_parser = _resolve_reasoning_parser(args, vllm_config)
+
     # NOTE: kept aligned with upstream `init_app_state`:
     # Use OnlineRenderer (replaced OpenAIServingRender which was removed upstream).
     state.online_renderer = OnlineRenderer(
@@ -1015,7 +1051,26 @@ async def omni_init_app_state(
         enable_auto_tools=args.enable_auto_tool_choice,
         exclude_tools_when_tool_choice_none=args.exclude_tools_when_tool_choice_none,
         tool_parser=args.tool_call_parser,
-        reasoning_parser=args.structured_outputs_config.reasoning_parser,
+        reasoning_parser=reasoning_parser,
+        default_chat_template_kwargs=args.default_chat_template_kwargs,
+        log_error_stack=args.log_error_stack,
+    )
+
+    # Upstream ``build_app`` registers the /render and /derender routes whenever
+    # ``--enable-scale-out`` or ``--tokens-only`` is set; their handlers read
+    # ``serving_render`` / ``serving_derender`` from ``app.state``, so the
+    # derenderer has to exist here or those routes answer "not supported".
+    state.online_derenderer = OnlineDerenderer(
+        model_config=engine_client.model_config,
+        renderer=engine_client.renderer,
+        request_logger=request_logger,
+        chat_template=resolved_chat_template,
+        chat_template_content_format=args.chat_template_content_format,
+        trust_request_chat_template=args.trust_request_chat_template,
+        enable_auto_tools=args.enable_auto_tool_choice,
+        exclude_tools_when_tool_choice_none=args.exclude_tools_when_tool_choice_none,
+        tool_parser=args.tool_call_parser,
+        reasoning_parser=reasoning_parser,
         default_chat_template_kwargs=args.default_chat_template_kwargs,
         log_error_stack=args.log_error_stack,
     )
@@ -1032,7 +1087,7 @@ async def omni_init_app_state(
             enable_auto_tools=args.enable_auto_tool_choice,
             tool_parser=args.tool_call_parser,
             tool_server=tool_server,
-            reasoning_parser=args.structured_outputs_config.reasoning_parser,
+            reasoning_parser=reasoning_parser,
             enable_prompt_tokens_details=args.enable_prompt_tokens_details,
             enable_force_include_usage=args.enable_force_include_usage,
             enable_log_outputs=args.enable_log_outputs,
@@ -1055,7 +1110,7 @@ async def omni_init_app_state(
         enable_auto_tools=args.enable_auto_tool_choice,
         exclude_tools_when_tool_choice_none=args.exclude_tools_when_tool_choice_none,
         tool_parser=args.tool_call_parser,
-        reasoning_parser=args.structured_outputs_config.reasoning_parser,
+        reasoning_parser=reasoning_parser,
         enable_prompt_tokens_details=args.enable_prompt_tokens_details,
         enable_force_include_usage=args.enable_force_include_usage,
         enable_log_outputs=args.enable_log_outputs,
@@ -1169,10 +1224,32 @@ async def omni_init_app_state(
             return_tokens_as_token_ids=args.return_tokens_as_token_ids,
             enable_auto_tools=args.enable_auto_tool_choice,
             tool_parser=args.tool_call_parser,
-            reasoning_parser=args.structured_outputs_config.reasoning_parser,
+            reasoning_parser=reasoning_parser,
             enable_prompt_tokens_details=args.enable_prompt_tokens_details,
             enable_force_include_usage=args.enable_force_include_usage,
             default_chat_template_kwargs=args.default_chat_template_kwargs,
+        )
+        if "generate" in supported_tasks
+        else None
+    )
+    # Scale-out surface (Disaggregated Everything): kept aligned with upstream
+    # ``init_scale_out_state``. ``--tokens-only`` forces ``detokenize=False`` on
+    # /inference/v1/generate; render / derender run on the same tokenizer.
+    state.serving_render = (
+        ServingRender(
+            state.openai_serving_models,
+            state.online_renderer,
+            request_logger=request_logger,
+            tool_server=state.tool_server,
+        )
+        if "generate" in supported_tasks
+        else None
+    )
+    state.serving_derender = (
+        ServingDerender(
+            state.openai_serving_models,
+            state.online_derenderer,
+            request_logger=request_logger,
         )
         if "generate" in supported_tasks
         else None
